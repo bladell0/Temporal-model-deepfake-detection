@@ -1,0 +1,516 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models, transforms
+from PIL import Image
+import numpy as np
+from pathlib import Path
+import json
+
+# ==========================================
+# MODEL ARCHITECTURES
+# ==========================================
+
+# ===== TEMPORAL MODEL =====
+class TemporalResNetLSTM(nn.Module):
+    def __init__(self, hidden_dim=512, num_layers=2, num_classes=2, bidirectional=True, dropout=0.3):
+        super().__init__()
+        base_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.base_model = base_model
+        self.feature_extractor = nn.Sequential(*list(base_model.children())[:-1])
+        self.feature_dim = base_model.fc.in_features  # 2048
+        self.layernorm = nn.LayerNorm(self.feature_dim)
+        self.lstm = nn.LSTM(
+            input_size=self.feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        direction_factor = 2 if bidirectional else 1
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * direction_factor, num_classes)
+
+    def forward(self, x):
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)
+        with torch.no_grad():
+            feats = self.feature_extractor(x).view(B, T, -1)
+        feats = self.layernorm(feats)
+        lstm_out, _ = self.lstm(feats)
+        pooled = lstm_out[:, -1, :]
+        pooled = self.dropout(pooled)
+        out = self.fc(pooled)
+        return out
+
+
+# ===== SPATIAL MODEL =====
+class SimpleDenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv = nn.Conv2d(in_channels, growth_rate, kernel_size=3, padding=1, bias=False)
+
+    def forward(self, x):
+        out = self.conv(self.relu(self.bn(x)))
+        out = torch.cat([x, out], dim=1)
+        return out
+
+
+class SimpleDenseBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate=16, n_layers=3):
+        super().__init__()
+        layers = []
+        channels = in_channels
+        for i in range(n_layers):
+            layers.append(SimpleDenseLayer(channels, growth_rate))
+            channels += growth_rate
+        self.dense = nn.Sequential(*layers)
+        self.compress = nn.Conv2d(channels, in_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        out = self.dense(x)
+        out = self.compress(out)
+        out = self.relu(self.bn(out))
+        return out + x
+
+
+class SpatialAttentionWSdan(nn.Module):
+    def __init__(self, in_channels, K=8):
+        super().__init__()
+        self.K = K
+        self.att_conv = nn.Conv2d(in_channels, K, kernel_size=1, bias=True)
+        self.fuse_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, feats):
+        B, C, H, W = feats.shape
+        att_maps = self.att_conv(feats)
+        att_norm = F.softmax(att_maps.view(B, self.K, -1), dim=2).view(B, self.K, H, W)
+        aggregated = 0
+        for k in range(self.K):
+            ak = att_norm[:, k:k+1, :, :]
+            weighted = feats * ak
+            pooled = weighted.sum(dim=[2, 3], keepdim=True)
+            aggregated = aggregated + pooled
+        agg_map = aggregated.expand(-1, -1, H, W)
+        out = self.relu(self.bn(self.fuse_conv(agg_map * feats)))
+        return out + feats
+
+
+class SpatialNet(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        self.conv1 = resnet.conv1
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.dense_texture = SimpleDenseBlock(512, growth_rate=32, n_layers=3)
+        self.spatial_att = SpatialAttentionWSdan(512, K=8)
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.avgpool = resnet.avgpool
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2048, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.dense_texture(x)
+        x = self.spatial_att(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        logits = self.classifier(x)
+        return logits
+
+
+# ==========================================
+# UTILITY FUNCTIONS
+# ==========================================
+
+@st.cache_resource
+def load_temporal_model(checkpoint_path, device):
+    """Load the temporal LSTM model"""
+    model = TemporalResNetLSTM(
+        hidden_dim=512,
+        num_layers=2,
+        num_classes=2,
+        bidirectional=True,
+        dropout=0.3
+    ).to(device)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    return model
+
+
+@st.cache_resource
+def load_spatial_model(checkpoint_path, device):
+    """Load the spatial attention model"""
+    model = SpatialNet(num_classes=2).to(device)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state'])
+    model.eval()
+    return model
+
+
+def get_transforms():
+    """Get the image transforms for both models"""
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+
+def predict_temporal(model, frames, device):
+    """
+    Predict using temporal model
+    frames: list of PIL Images (should be 16 frames)
+    """
+    transform = get_transforms()
+    
+    # Convert frames to tensor
+    frame_tensors = [transform(frame) for frame in frames]
+    frame_tensors = torch.stack(frame_tensors)  # [T, C, H, W]
+    frame_tensors = frame_tensors.unsqueeze(0)  # [1, T, C, H, W]
+    frame_tensors = frame_tensors.to(device)
+    
+    with torch.no_grad():
+        outputs = model(frame_tensors)
+        probs = F.softmax(outputs, dim=1)
+        confidence = probs[0].cpu().numpy()
+    
+    return confidence
+
+
+def predict_spatial(model, frames, device):
+    """
+    Predict using spatial model (aggregates predictions from all frames)
+    frames: list of PIL Images
+    """
+    transform = get_transforms()
+    
+    all_probs = []
+    with torch.no_grad():
+        for frame in frames:
+            frame_tensor = transform(frame).unsqueeze(0).to(device)
+            outputs = model(frame_tensor)
+            probs = F.softmax(outputs, dim=1)
+            all_probs.append(probs[0].cpu().numpy())
+    
+    # Average probabilities across all frames
+    avg_confidence = np.mean(all_probs, axis=0)
+    return avg_confidence
+
+
+def ensemble_predict(temporal_conf, spatial_conf, temporal_weight=0.5):
+    """
+    Combine predictions from both models
+    """
+    ensemble_conf = temporal_weight * temporal_conf + (1 - temporal_weight) * spatial_conf
+    return ensemble_conf
+
+
+# ==========================================
+# STREAMLIT APP
+# ==========================================
+
+def main():
+    st.set_page_config(
+        page_title="Deepfake Detection System",
+        page_icon="🎭",
+        layout="wide"
+    )
+    
+    st.title("🎭 Deepfake Detection System")
+    st.markdown("Upload preprocessed video frames to detect whether they are real or fake")
+    
+    # Sidebar for configuration
+    st.sidebar.header("⚙️ Configuration")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    st.sidebar.info(f"**Device:** {device}")
+    
+    # Model selection
+    st.sidebar.subheader("Model Selection")
+    use_temporal = st.sidebar.checkbox("Use Temporal Model", value=True)
+    use_spatial = st.sidebar.checkbox("Use Spatial Model", value=True)
+    
+    if not use_temporal and not use_spatial:
+        st.error("Please select at least one model!")
+        return
+    
+    # Dataset selection for loading correct checkpoint
+    dataset_choice = st.sidebar.selectbox(
+        "Select Dataset Model",
+        ["FF++ cleaned", "Processed spatial"]
+    )
+    
+    # Ensemble weight (if both models selected)
+    if use_temporal and use_spatial:
+        temporal_weight = st.sidebar.slider(
+            "Temporal Model Weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.1,
+            help="Weight for temporal model in ensemble (1-weight goes to spatial model)"
+        )
+    
+    # Model paths
+    st.sidebar.subheader("Model Checkpoint Paths")
+    
+    temporal_base = r"Temporal_fixed_results"
+    spatial_base = r"C:\Users\Wolf\SEPTEMBER WORK\BLOCK 1 TEXTURAL\less weights code\checkpoints"
+    
+    if dataset_choice == "FF++ cleaned":
+        default_temporal = str(Path(temporal_base) / "FF++_cleaned_20251011_155130" / "best_temporal_FF++_cleaned.pth")
+        default_spatial = str(Path(spatial_base) / "best_FF++ cleaned_epoch19_acc0.8858.pth")
+    else:  # Processed spatial
+        default_temporal = str(Path(temporal_base) / "Processed_spatial_20251011_195713" / "best_temporal_Processed_spatial.pth")
+        default_spatial = str(Path(spatial_base) / "best_Processed spatial_epoch28_acc0.8845.pth")
+    
+    temporal_path = st.sidebar.text_input("Temporal Model Path", default_temporal)
+    spatial_path = st.sidebar.text_input("Spatial Model Path", default_spatial)
+    
+    # Load models
+    models_loaded = {}
+    
+    if use_temporal:
+        with st.spinner("Loading Temporal Model..."):
+            try:
+                temporal_model = load_temporal_model(temporal_path, device)
+                models_loaded['temporal'] = temporal_model
+                st.sidebar.success("✅ Temporal Model Loaded")
+            except Exception as e:
+                st.sidebar.error(f"❌ Error loading temporal model: {str(e)}")
+                return
+    
+    if use_spatial:
+        with st.spinner("Loading Spatial Model..."):
+            try:
+                spatial_model = load_spatial_model(spatial_path, device)
+                models_loaded['spatial'] = spatial_model
+                st.sidebar.success("✅ Spatial Model Loaded")
+            except Exception as e:
+                st.sidebar.error(f"❌ Error loading spatial model: {str(e)}")
+                return
+    
+    # Main content
+    st.header("📤 Upload Video Frames")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.info("""
+        **Instructions:**
+        - For Temporal Model: Upload exactly **16 consecutive frames** from a video
+        - For Spatial Model: Upload **any number of frames** (they will be averaged)
+        - For Both Models: Upload **16 or more frames** for best results
+        - Frames should be preprocessed (cropped faces, 224x224 recommended)
+        """)
+    
+    with col2:
+        if use_temporal and not use_spatial:
+            min_frames = 16
+            max_frames = 16
+            st.warning(f"Upload exactly {min_frames} frames")
+        elif use_temporal and use_spatial:
+            min_frames = 16
+            max_frames = None
+            st.info(f"Upload at least {min_frames} frames")
+        else:  # spatial only
+            min_frames = 1
+            max_frames = None
+            st.info("Upload any number of frames")
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "Choose frame images",
+        type=['jpg', 'jpeg', 'png'],
+        accept_multiple_files=True,
+        help="Upload preprocessed video frames in order"
+    )
+    
+    if uploaded_files:
+        num_frames = len(uploaded_files)
+        st.success(f"✅ {num_frames} frames uploaded")
+        
+        # Validate frame count
+        if use_temporal and num_frames < 16:
+            st.error(f"❌ Temporal model requires at least 16 frames. You uploaded {num_frames}.")
+            return
+        
+        if use_temporal and not use_spatial and num_frames != 16:
+            st.error(f"❌ Temporal model (alone) requires exactly 16 frames. You uploaded {num_frames}.")
+            return
+        
+        # Display uploaded frames
+        with st.expander("👁️ View Uploaded Frames", expanded=False):
+            cols = st.columns(8)
+            for idx, uploaded_file in enumerate(uploaded_files[:16]):  # Show first 16
+                with cols[idx % 8]:
+                    image = Image.open(uploaded_file).convert('RGB')
+                    st.image(image, caption=f"Frame {idx+1}", use_container_width=True)
+        
+        # Predict button
+        if st.button("🔍 Analyze Frames", type="primary", use_container_width=True):
+            
+            # Load all frames
+            frames = []
+            for uploaded_file in uploaded_files:
+                image = Image.open(uploaded_file).convert('RGB')
+                frames.append(image)
+            
+            st.markdown("---")
+            st.header("📊 Analysis Results")
+            
+            results = {}
+            
+            # Temporal prediction
+            if use_temporal:
+                with st.spinner("Running Temporal Model..."):
+                    # Use first 16 frames for temporal model
+                    temporal_frames = frames[:16]
+                    temporal_conf = predict_temporal(
+                        models_loaded['temporal'],
+                        temporal_frames,
+                        device
+                    )
+                    results['temporal'] = temporal_conf
+            
+            # Spatial prediction
+            if use_spatial:
+                with st.spinner("Running Spatial Model..."):
+                    spatial_conf = predict_spatial(
+                        models_loaded['spatial'],
+                        frames,
+                        device
+                    )
+                    results['spatial'] = spatial_conf
+            
+            # Display results
+            result_cols = st.columns(len(results) + (1 if len(results) > 1 else 0))
+            
+            col_idx = 0
+            
+            if 'temporal' in results:
+                with result_cols[col_idx]:
+                    st.subheader("🎬 Temporal Model")
+                    conf = results['temporal']
+                    
+                    fake_conf = conf[1] * 100
+                    real_conf = conf[0] * 100
+                    
+                    st.metric("Fake Confidence", f"{fake_conf:.2f}%")
+                    st.metric("Real Confidence", f"{real_conf:.2f}%")
+                    
+                    prediction = "FAKE" if fake_conf > real_conf else "REAL"
+                    color = "red" if prediction == "FAKE" else "green"
+                    st.markdown(f"**Prediction:** :{color}[{prediction}]")
+                    
+                col_idx += 1
+            
+            if 'spatial' in results:
+                with result_cols[col_idx]:
+                    st.subheader("🖼️ Spatial Model")
+                    conf = results['spatial']
+                    
+                    fake_conf = conf[1] * 100
+                    real_conf = conf[0] * 100
+                    
+                    st.metric("Fake Confidence", f"{fake_conf:.2f}%")
+                    st.metric("Real Confidence", f"{real_conf:.2f}%")
+                    
+                    prediction = "FAKE" if fake_conf > real_conf else "REAL"
+                    color = "red" if prediction == "FAKE" else "green"
+                    st.markdown(f"**Prediction:** :{color}[{prediction}]")
+                    
+                col_idx += 1
+            
+            # Ensemble result
+            if len(results) > 1:
+                with result_cols[col_idx]:
+                    st.subheader("🎯 Ensemble")
+                    ensemble_conf = ensemble_predict(
+                        results['temporal'],
+                        results['spatial'],
+                        temporal_weight
+                    )
+                    
+                    fake_conf = ensemble_conf[1] * 100
+                    real_conf = ensemble_conf[0] * 100
+                    
+                    st.metric("Fake Confidence", f"{fake_conf:.2f}%")
+                    st.metric("Real Confidence", f"{real_conf:.2f}%")
+                    
+                    prediction = "FAKE" if fake_conf > real_conf else "REAL"
+                    color = "red" if prediction == "FAKE" else "green"
+                    st.markdown(f"**Final Prediction:** :{color}[**{prediction}**]")
+            
+            # Detailed breakdown
+            st.markdown("---")
+            st.subheader("📋 Detailed Confidence Scores")
+            
+            breakdown_data = []
+            
+            if 'temporal' in results:
+                breakdown_data.append({
+                    "Model": "Temporal (LSTM)",
+                    "Real Confidence": f"{results['temporal'][0]*100:.2f}%",
+                    "Fake Confidence": f"{results['temporal'][1]*100:.2f}%",
+                    "Prediction": "FAKE" if results['temporal'][1] > results['temporal'][0] else "REAL"
+                })
+            
+            if 'spatial' in results:
+                breakdown_data.append({
+                    "Model": "Spatial (Attention)",
+                    "Real Confidence": f"{results['spatial'][0]*100:.2f}%",
+                    "Fake Confidence": f"{results['spatial'][1]*100:.2f}%",
+                    "Prediction": "FAKE" if results['spatial'][1] > results['spatial'][0] else "REAL"
+                })
+            
+            if len(results) > 1:
+                breakdown_data.append({
+                    "Model": f"Ensemble ({temporal_weight:.1f}/{1-temporal_weight:.1f})",
+                    "Real Confidence": f"{ensemble_conf[0]*100:.2f}%",
+                    "Fake Confidence": f"{ensemble_conf[1]*100:.2f}%",
+                    "Prediction": "FAKE" if ensemble_conf[1] > ensemble_conf[0] else "REAL"
+                })
+            
+            st.table(breakdown_data)
+            
+            # Analysis notes
+            st.info("""
+            **Note:** 
+            - Temporal model analyzes motion patterns across 16 frames
+            - Spatial model analyzes texture and attention in each frame independently
+            - Ensemble combines both approaches for robust detection
+            """)
+
+
+if __name__ == "__main__":
+    main()

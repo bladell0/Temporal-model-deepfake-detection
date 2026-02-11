@@ -1,0 +1,992 @@
+# enhanced_temporal_trainer.py
+import os
+import json
+import time
+import multiprocessing
+from glob import glob
+from collections import Counter
+from tqdm import tqdm
+from PIL import Image
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import models, transforms
+
+# =========================================================
+# Config (tweak as needed)
+# =========================================================
+EPOCHS = 40
+BATCH_SIZE = 4
+SEQUENCE_LENGTH = 16
+CACHE_INDEX = True
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_WORKERS = max(1, multiprocessing.cpu_count() // 2) if os.name != "nt" else 0
+
+# Fine-tuning schedule: after FINETUNE_EPOCH, unfreeze last layer group of ResNet
+FINETUNE_EPOCH = 5
+FINETUNE_UNFREEZE_LAST_N_BLOCKS = 1  # unfreeze last ResNet layer/block groups (1 -> layer4)
+
+# Misc
+GRAD_CLIP = 1.0
+LR = 1e-4
+WEIGHT_DECAY = 1e-5
+PATIENCE_LR = 3  # for ReduceLROnPlateau
+RANDOM_SEED = 42
+
+DATASETS = [
+    {
+        "name": "FF++ cleaned",
+        "train_dir": r"C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\train",
+        "val_dir": r"C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\val",
+        "test_dir": r"C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\test"
+    },
+    {
+        "name": "Processed spatial",
+        "train_dir": r"D:\processed_spatial\train",
+        "val_dir": r"D:\processed_spatial\val",
+        "test_dir": r"D:\processed_spatial\test"
+    }
+]
+
+# Set fixed seeds for reproducibility where possible
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+if DEVICE == "cuda":
+    torch.cuda.manual_seed_all(RANDOM_SEED)
+
+# =========================================================
+# Dataset with temporal sampling modes
+# =========================================================
+class DeepFakeSequenceDataset(Dataset):
+    def __init__(self, root_dir, sequence_length, transform, cache_index=True, mode="train"):
+        """
+        mode: "train" -> random temporal window sampling
+              "val" or "test" -> center (deterministic) sampling
+        """
+        self.root_dir = root_dir
+        self.sequence_length = sequence_length
+        self.transform = transform
+        self.mode = mode
+        self.samples = []
+
+        index_cache = os.path.join(self.root_dir, "index_cache.json")
+        if cache_index and os.path.exists(index_cache):
+            self.samples = json.load(open(index_cache))
+            print(f"💾 Loaded cached index from {index_cache}")
+        else:
+            print(f"📂 Scanning dataset: {self.root_dir}")
+            for label_name in ["real", "fake"]:
+                label_dir = os.path.join(self.root_dir, label_name)
+                if not os.path.exists(label_dir):
+                    continue
+                for video_folder in tqdm(os.listdir(label_dir), desc=f"Indexing {label_name}"):
+                    video_path = os.path.join(label_dir, video_folder)
+                    if os.path.isdir(video_path):
+                        frame_paths = sorted(glob(os.path.join(video_path, "*.jpg")))
+                        if len(frame_paths) >= sequence_length:
+                            self.samples.append({
+                                "frames": frame_paths,
+                                "label": 0 if label_name == "real" else 1
+                            })
+            if cache_index:
+                json.dump(self.samples, open(index_cache, "w"))
+                print(f"💾 Cached index saved at {index_cache}")
+        print(f"✅ Total samples: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _sample_frame_indices(self, n_frames):
+        L = len(n_frames)
+        S = self.sequence_length
+        if self.mode == "train":
+            # random contiguous window
+            if L == S:
+                start = 0
+            else:
+                start = np.random.randint(0, L - S + 1)
+            return list(range(start, start + S))
+        else:
+            # deterministic center crop
+            if L == S:
+                start = 0
+            else:
+                start = max(0, (L - S) // 2)
+            return list(range(start, start + S))
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        frames = sample["frames"]
+        indices = self._sample_frame_indices(frames)
+        selected = [frames[i] for i in indices]
+        imgs = [self.transform(Image.open(fp).convert("RGB")) for fp in selected]
+        imgs = torch.stack(imgs)  # [T, C, H, W]
+        label = torch.tensor(sample["label"], dtype=torch.long)
+        return imgs, label
+
+# =========================================================
+# Model: keep ResNet50 backbone but add small improvements
+# =========================================================
+class TemporalResNetLSTM(nn.Module):
+    def __init__(self, hidden_dim=512, num_layers=2, num_classes=2, bidirectional=True, dropout=0.3, freeze_backbone=True):
+        super().__init__()
+        base_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
+        # keep backbone as-is; we will freeze/unfreeze accordingly
+        self.base_model = base_model
+        self.feature_extractor = nn.Sequential(*list(base_model.children())[:-1])  # exclude fc
+        if freeze_backbone:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+
+        self.feature_dim = base_model.fc.in_features  # 2048 for resnet50
+
+        # small normalization on temporal features
+        self.layernorm = nn.LayerNorm(self.feature_dim)
+
+        self.lstm = nn.LSTM(
+            input_size=self.feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        direction_factor = 2 if bidirectional else 1
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * direction_factor, num_classes)
+
+    def forward(self, x):
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        x = x.view(B * T, C, H, W)  # [B*T, C, H, W]
+        # extract features frame-wise
+        with torch.no_grad():
+            feats = self.feature_extractor(x).view(B, T, -1)  # [B, T, feat_dim]
+        # if some backbone params are trainable they will be used, but by default above we freeze
+        # apply normalization on last dim
+        feats = self.layernorm(feats)
+        lstm_out, _ = self.lstm(feats)  # [B, T, hidden*dir]
+        pooled = lstm_out[:, -1, :]  # use last timestep (you can also try mean over time)
+        pooled = self.dropout(pooled)
+        out = self.fc(pooled)
+        return out
+
+    def unfreeze_backbone_last_layers(self, last_n_blocks=1):
+        """
+        Unfreeze the last few layer groups of ResNet (e.g., layer4)
+        ResNet's children roughly: conv1, bn1, relu, maxpool, layer1, layer2, layer3, layer4, avgpool
+        """
+        children = list(self.base_model.children())
+        # find layer groups by name: layer1..layer4
+        for name, module in self.base_model.named_children():
+            if name in ["layer4", "layer3", "layer2", "layer1"]:
+                # we'll decide which to unfreeze by order
+                pass
+        # unfreeze last N layer groups by order
+        layer_names = ["layer4", "layer3", "layer2", "layer1"]
+        to_unfreeze = layer_names[:last_n_blocks]  # start from layer4
+        for name, module in self.base_model.named_children():
+            if name in to_unfreeze:
+                for p in module.parameters():
+                    p.requires_grad = True
+        print(f"🔓 Unfroze backbone layers: {to_unfreeze}")
+
+# =========================================================
+# Utility: plotting and metrics saving
+# =========================================================
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def save_training_curves(history, out_dir):
+    # history: dict of lists: train_loss, val_loss, train_acc, val_acc
+    epochs = range(1, len(history["train_loss"]) + 1)
+    plt.figure()
+    plt.plot(epochs, history["train_loss"], label="train loss")
+    plt.plot(epochs, history["val_loss"], label="val loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("Loss curve")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "loss_curve.png"))
+    plt.close()
+
+    plt.figure()
+    plt.plot(epochs, [a * 100 for a in history["train_acc"]], label="train acc")
+    plt.plot(epochs, [a * 100 for a in history["val_acc"]], label="val acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.legend()
+    plt.title("Accuracy curve")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "acc_curve.png"))
+    plt.close()
+
+def save_confusion_matrix(y_true, y_pred, out_path, labels=["real", "fake"]):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp.plot(ax=ax, cmap=plt.cm.Blues, values_format='d')
+    plt.title("Confusion Matrix")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    return cm
+
+# =========================================================
+# Train / Validate / Test loops with sampler and metrics
+# =========================================================
+def make_sampler_from_dataset(dataset):
+    # compute sample weights inversely proportional to class frequency
+    labels = [s["label"] for s in dataset.samples]
+    class_counts = Counter(labels)
+    # weight per class = 1 / count
+    class_weight = {cls: 1.0 / cnt for cls, cnt in class_counts.items()}
+    sample_weights = [class_weight[s] for s in labels]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    return sampler, class_counts
+
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
+    model.train()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    for x, y in tqdm(loader, desc="Training", leave=False):
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            outputs = model(x)
+            loss = criterion(outputs, y)
+        scaler.scale(loss).backward()
+        # gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item() * x.size(0)
+        preds = outputs.argmax(1)
+        total_correct += (preds == y).sum().item()
+        total_samples += x.size(0)
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for x, y in tqdm(loader, desc="Validating", leave=False):
+            x, y = x.to(device), y.to(device)
+            outputs = model(x)
+            loss = criterion(outputs, y)
+            total_loss += loss.item() * x.size(0)
+            preds = outputs.argmax(1)
+            total_correct += (preds == y).sum().item()
+            total_samples += x.size(0)
+            all_preds.extend(preds.cpu().numpy().tolist())
+            all_labels.extend(y.cpu().numpy().tolist())
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
+    return avg_loss, avg_acc, all_labels, all_preds
+
+# =========================================================
+# Main training per dataset (enhanced)
+# =========================================================
+def run_training(dataset_info):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    result_dir = ensure_dir(os.path.join("Temporal_fixed_results", f"{dataset_info['name'].replace(' ', '_')}_{ts}"))
+    print(f"\n============================")
+    print(f"🧠 Training on dataset: {dataset_info['name']}")
+    print(f"Results dir: {result_dir}")
+    print(f"============================")
+
+    # transforms: include slight augmentation for train, and ImageNet normalization
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.05),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    ])
+    eval_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=imagenet_mean, std=imagenet_std)
+    ])
+
+    train_ds = DeepFakeSequenceDataset(dataset_info["train_dir"], SEQUENCE_LENGTH, train_transform, CACHE_INDEX, mode="train")
+    val_ds = DeepFakeSequenceDataset(dataset_info["val_dir"], SEQUENCE_LENGTH, eval_transform, CACHE_INDEX, mode="val")
+    test_ds = None
+    if os.path.exists(dataset_info.get("test_dir", "")):
+        test_ds = DeepFakeSequenceDataset(dataset_info["test_dir"], SEQUENCE_LENGTH, eval_transform, CACHE_INDEX, mode="test")
+
+    # make sampler to handle class imbalance
+    sampler, class_counts = make_sampler_from_dataset(train_ds)
+    print(f"Class counts (train): {class_counts}")
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = None
+    if test_ds:
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+    print(f"🧩 num_workers={NUM_WORKERS}, train_batches={len(train_loader)}, val_batches={len(val_loader)}")
+
+    model = TemporalResNetLSTM(freeze_backbone=True).to(DEVICE)                                                                                                       
+
+    # loss with class weighting as extra safety (sampler already balances, this complements it)
+    # compute class weights inverse frequency
+    train_label_list = [s["label"] for s in train_ds.samples]
+    cnt = Counter(train_label_list)
+    total = sum(cnt.values())
+    # weight = total/count -> smaller class gets larger weight
+    weights = [total / cnt[i] if i in cnt else 1.0 for i in range(2)]
+    class_weight_tensor = torch.tensor(weights, device=DEVICE, dtype=torch.float32)
+    criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
+
+    # optimizer only for trainable params (initially LSTM and fc)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=PATIENCE_LR, factor=0.5, verbose=True)
+    scaler = torch.cuda.amp.GradScaler()
+
+    print(f"🔥 Using device: {DEVICE}")
+    if DEVICE == "cuda":
+        try:
+            print(f"🚀 GPU: {torch.cuda.get_device_name(0)} | Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        except Exception:
+            pass                                                                                                                                                                                     
+
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    best_val_acc = 0.0
+    best_ckpt_path = None
+
+    for epoch in range(EPOCHS):
+        print(f"\nEpoch [{epoch+1}/{EPOCHS}]")
+        # optionally unfreeze backbone after FINETUNE_EPOCH
+        if epoch + 1 == FINETUNE_EPOCH:
+            model.unfreeze_backbone_last_layers(last_n_blocks=FINETUNE_UNFREEZE_LAST_N_BLOCKS)
+            # update optimizer to include newly trainable params
+            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR / 10, weight_decay=WEIGHT_DECAY)
+            scaler = torch.cuda.amp.GradScaler()  # reinit scaler (safe)
+            print("🔁 Optimizer reinitialized to include backbone params (lower lr).")                                                                                                              #DONE TILL HERE
+
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, DEVICE)
+        val_loss, val_acc, val_labels, val_preds = validate(model, val_loader, criterion, DEVICE)
+
+        print(f"📊 Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}%")
+        print(f"📈 Val Loss: {val_loss:.4f} | Val Acc: {val_acc*100:.2f}%")
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        # scheduler step on validation accuracy (we want to maximize it)
+        scheduler.step(val_acc)
+
+        # save best model (full checkpoint)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            ckpt_path = os.path.join(result_dir, f"best_temporal_{dataset_info['name'].replace(' ', '_')}.pth")
+            torch.save({
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "val_acc": val_acc,
+                "history": history,
+                "class_weights": weights
+            }, ckpt_path)
+            best_ckpt_path = ckpt_path
+            print(f"💾 Saved best checkpoint: {ckpt_path} with Val Acc: {val_acc*100:.2f}%")
+
+    # after training: save curves
+    save_training_curves(history, result_dir)
+
+    # evaluation on validation set (we already have val preds)
+    cm_path = os.path.join(result_dir, "confusion_matrix_val.png")
+    save_confusion_matrix(val_labels, val_preds, cm_path, labels=["real", "fake"])
+    report = classification_report(val_labels, val_preds, target_names=["real", "fake"], output_dict=True)
+    with open(os.path.join(result_dir, "val_classification_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+
+    # If test set exists, run full test evaluation
+    if test_loader is not None:
+        test_loss, test_acc, test_labels, test_preds = validate(model, test_loader, criterion, DEVICE)
+        test_cm_path = os.path.join(result_dir, "confusion_matrix_test.png")
+        save_confusion_matrix(test_labels, test_preds, test_cm_path, labels=["real", "fake"])
+        test_report = classification_report(test_labels, test_preds, target_names=["real", "fake"], output_dict=True)
+        with open(os.path.join(result_dir, "test_classification_report.json"), "w") as f:
+            json.dump(test_report, f, indent=2)
+    else:
+        test_loss = test_acc = None
+
+    # save summary metadata
+    summary = {
+        "dataset": dataset_info["name"],
+        "train_size": len(train_ds),
+        "val_size": len(val_ds),
+        "test_size": len(test_ds) if test_ds else 0,
+        "class_counts_train": class_counts,
+        "best_val_acc": best_val_acc,
+        "best_checkpoint": best_ckpt_path,
+        "history": {
+            "train_loss": history["train_loss"],
+            "val_loss": history["val_loss"],
+            "train_acc": history["train_acc"],
+            "val_acc": history["val_acc"]
+        },
+        "final_test_acc": test_acc
+    }
+    with open(os.path.join(result_dir, "results_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\n✅ Training complete for {dataset_info['name']} | Best Val Acc: {best_val_acc*100:.2f}%")
+    print(f"Results saved at: {result_dir}")
+    return best_val_acc, result_dir
+
+# =========================================================
+# Run both datasets
+# =========================================================
+def main():
+    results = {}
+    for dataset_info in DATASETS:
+        acc, outdir = run_training(dataset_info)
+        results[dataset_info["name"]] = {"best_val_acc": acc, "results_dir": outdir}
+
+    print("\n📊 FINAL RESULTS:")
+    for k, v in results.items():
+        print(f"  • {k}: {v['best_val_acc']*100:.2f}% | results: {v['results_dir']}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------temp result-------------------------
+
+============================
+🧠 Training on dataset: FF++ cleaned
+Results dir: Temporal_fixed_results\FF++_cleaned_20251011_155130
+============================
+💾 Loaded cached index from C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\train\index_cache.json
+✅ Total samples: 4850
+💾 Loaded cached index from C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\val\index_cache.json
+✅ Total samples: 1043
+📂 Scanning dataset: C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\test
+Indexing real: 100%|███████████████████████████████████████████████████████████████| 150/150 [00:00<00:00, 3254.86it/s]
+Indexing fake: 100%|███████████████████████████████████████████████████████████████| 893/893 [00:00<00:00, 3070.26it/s]
+💾 Cached index saved at C:\Users\Wolf\FF++ preprocessing\3-Cleaning dataset of multiple faces\test\index_cache.json
+✅ Total samples: 1041
+Class counts (train): Counter({1: 4157, 0: 693})
+🧩 num_workers=0, train_batches=1213, val_batches=261
+C:\Users\Wolf\.conda\envs\deepfake\lib\site-packages\torch\optim\lr_scheduler.py:62: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:365: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()
+🔥 Using device: cuda
+🚀 GPU: NVIDIA GeForce RTX 3060 | Memory: 12.88 GB
+
+Epoch [1/40]
+Training:   0%|                                                                               | 0/1213 [00:00<?, ?it/s]C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:265: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast():
+                                                                                                                       
+📊 Train Loss: 0.4678 | Train Acc: 62.35%
+📈 Val Loss: 0.9170 | Val Acc: 53.21%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 53.21%
+
+Epoch [2/40]
+                                                                                                                       
+📊 Train Loss: 0.4332 | Train Acc: 70.64%
+📈 Val Loss: 1.0874 | Val Acc: 54.46%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 54.46%
+
+Epoch [3/40]
+                                                                                                                       
+📊 Train Loss: 0.4140 | Train Acc: 72.82%
+📈 Val Loss: 1.0378 | Val Acc: 62.22%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 62.22%
+
+Epoch [4/40]
+                                                                                                                       
+📊 Train Loss: 0.4050 | Train Acc: 74.72%
+📈 Val Loss: 0.6629 | Val Acc: 73.25%
+C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:385: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()  # reinit scaler (safe)
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 73.25%
+
+Epoch [5/40]
+🔓 Unfroze backbone layers: ['layer4']
+🔁 Optimizer reinitialized to include backbone params (lower lr).
+                                                                                                                       
+📊 Train Loss: 0.3701 | Train Acc: 78.04%
+📈 Val Loss: 0.7001 | Val Acc: 73.44%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 73.44%
+
+Epoch [6/40]
+                                                                                                                       
+📊 Train Loss: 0.3604 | Train Acc: 78.72%
+📈 Val Loss: 0.7030 | Val Acc: 73.73%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 73.73%
+
+Epoch [7/40]
+                                                                                                                       
+📊 Train Loss: 0.3803 | Train Acc: 79.36%
+📈 Val Loss: 0.7560 | Val Acc: 71.52%
+
+Epoch [8/40]
+                                                                                                                       
+📊 Train Loss: 0.3674 | Train Acc: 81.18%
+📈 Val Loss: 0.6971 | Val Acc: 74.69%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 74.69%
+
+Epoch [9/40]
+                                                                                                                       
+📊 Train Loss: 0.3654 | Train Acc: 80.21%
+📈 Val Loss: 0.6083 | Val Acc: 77.76%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 77.76%
+
+Epoch [10/40]
+                                                                                                                       
+📊 Train Loss: 0.3507 | Train Acc: 81.42%
+📈 Val Loss: 0.8055 | Val Acc: 71.52%
+
+Epoch [11/40]
+                                                                                                                       
+📊 Train Loss: 0.3528 | Train Acc: 80.60%
+📈 Val Loss: 0.6845 | Val Acc: 75.17%
+
+Epoch [12/40]
+                                                                                                                       
+📊 Train Loss: 0.3415 | Train Acc: 81.55%
+📈 Val Loss: 0.6994 | Val Acc: 75.17%
+
+Epoch [13/40]
+                                                                                                                       
+📊 Train Loss: 0.3208 | Train Acc: 82.95%
+📈 Val Loss: 0.8495 | Val Acc: 72.58%
+
+Epoch [14/40]
+                                                                                                                       
+📊 Train Loss: 0.3349 | Train Acc: 82.72%
+📈 Val Loss: 0.7346 | Val Acc: 75.93%
+
+Epoch [15/40]
+                                                                                                                       
+📊 Train Loss: 0.3477 | Train Acc: 82.49%
+📈 Val Loss: 0.6548 | Val Acc: 77.56%
+
+Epoch [16/40]
+                                                                                                                       
+📊 Train Loss: 0.3224 | Train Acc: 83.48%
+📈 Val Loss: 0.6419 | Val Acc: 79.58%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 79.58%
+
+Epoch [17/40]
+                                                                                                                       
+📊 Train Loss: 0.3370 | Train Acc: 83.59%
+📈 Val Loss: 0.8157 | Val Acc: 75.46%
+
+Epoch [18/40]
+                                                                                                                       
+📊 Train Loss: 0.3366 | Train Acc: 83.38%
+📈 Val Loss: 0.6487 | Val Acc: 78.62%
+
+Epoch [19/40]
+                                                                                                                       
+📊 Train Loss: 0.3136 | Train Acc: 84.85%
+📈 Val Loss: 0.9368 | Val Acc: 72.00%
+
+Epoch [20/40]
+                                                                                                                       
+📊 Train Loss: 0.3082 | Train Acc: 84.76%
+📈 Val Loss: 0.6900 | Val Acc: 78.72%
+
+Epoch [21/40]
+                                                                                                                       
+📊 Train Loss: 0.3301 | Train Acc: 84.45%
+📈 Val Loss: 0.7019 | Val Acc: 78.81%
+
+Epoch [22/40]
+                                                                                                                       
+📊 Train Loss: 0.3218 | Train Acc: 85.55%
+📈 Val Loss: 0.9659 | Val Acc: 74.98%
+
+Epoch [23/40]
+                                                                                                                       
+📊 Train Loss: 0.3199 | Train Acc: 84.80%
+📈 Val Loss: 0.7993 | Val Acc: 77.18%
+
+Epoch [24/40]
+                                                                                                                       
+📊 Train Loss: 0.3051 | Train Acc: 86.02%
+📈 Val Loss: 0.8880 | Val Acc: 74.98%
+
+Epoch [25/40]
+                                                                                                                       
+📊 Train Loss: 0.3096 | Train Acc: 85.38%
+📈 Val Loss: 0.8552 | Val Acc: 76.41%
+
+Epoch [26/40]
+                                                                                                                       
+📊 Train Loss: 0.2908 | Train Acc: 86.35%
+📈 Val Loss: 0.7634 | Val Acc: 78.24%
+
+Epoch [27/40]
+                                                                                                                       
+📊 Train Loss: 0.2751 | Train Acc: 86.43%
+📈 Val Loss: 0.7566 | Val Acc: 78.91%
+
+Epoch [28/40]
+                                                                                                                       
+📊 Train Loss: 0.2989 | Train Acc: 85.67%
+📈 Val Loss: 0.7284 | Val Acc: 79.48%
+
+Epoch [29/40]
+                                                                                                                       
+📊 Train Loss: 0.2792 | Train Acc: 87.03%
+📈 Val Loss: 0.7446 | Val Acc: 79.39%
+
+Epoch [30/40]
+                                                                                                                       
+📊 Train Loss: 0.3053 | Train Acc: 85.67%
+📈 Val Loss: 0.8083 | Val Acc: 77.66%
+
+Epoch [31/40]
+                                                                                                                       
+📊 Train Loss: 0.2801 | Train Acc: 87.11%
+📈 Val Loss: 0.7953 | Val Acc: 79.00%
+
+Epoch [32/40]
+                                                                                                                       
+📊 Train Loss: 0.2805 | Train Acc: 87.73%
+📈 Val Loss: 0.7810 | Val Acc: 78.24%
+
+Epoch [33/40]
+                                                                                                                       
+📊 Train Loss: 0.2919 | Train Acc: 87.07%
+📈 Val Loss: 0.8708 | Val Acc: 77.28%
+
+Epoch [34/40]
+                                                                                                                       
+📊 Train Loss: 0.2672 | Train Acc: 88.43%
+📈 Val Loss: 0.8706 | Val Acc: 77.85%
+
+Epoch [35/40]
+                                                                                                                       
+📊 Train Loss: 0.2715 | Train Acc: 87.88%
+📈 Val Loss: 0.7978 | Val Acc: 79.96%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 79.96%
+
+Epoch [36/40]
+                                                                                                                       
+📊 Train Loss: 0.2834 | Train Acc: 87.59%
+📈 Val Loss: 0.7939 | Val Acc: 78.62%
+
+Epoch [37/40]
+                                                                                                                       
+📊 Train Loss: 0.2631 | Train Acc: 88.43%
+📈 Val Loss: 0.9221 | Val Acc: 77.47%
+
+Epoch [38/40]
+                                                                                                                       
+📊 Train Loss: 0.2964 | Train Acc: 87.40%
+📈 Val Loss: 0.8338 | Val Acc: 80.15%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 80.15%
+
+Epoch [39/40]
+                                                                                                                       
+📊 Train Loss: 0.2848 | Train Acc: 87.46%
+📈 Val Loss: 0.7759 | Val Acc: 81.78%
+💾 Saved best checkpoint: Temporal_fixed_results\FF++_cleaned_20251011_155130\best_temporal_FF++_cleaned.pth with Val Acc: 81.78%
+
+Epoch [40/40]
+                                                                                                                       
+📊 Train Loss: 0.2696 | Train Acc: 88.33%
+📈 Val Loss: 0.9179 | Val Acc: 76.70%
+                                                                                                                       
+
+✅ Training complete for FF++ cleaned | Best Val Acc: 81.78%
+Results saved at: Temporal_fixed_results\FF++_cleaned_20251011_155130
+
+============================
+🧠 Training on dataset: Processed spatial
+Results dir: Temporal_fixed_results\Processed_spatial_20251011_195713
+============================
+💾 Loaded cached index from D:\processed_spatial\train\index_cache.json
+✅ Total samples: 2366
+💾 Loaded cached index from D:\processed_spatial\val\index_cache.json
+✅ Total samples: 511
+📂 Scanning dataset: D:\processed_spatial\test
+Indexing real: 100%|██████████████████████████████████████████████████████████████████| 55/55 [00:00<00:00, 879.89it/s]
+Indexing fake: 100%|███████████████████████████████████████████████████████████████| 461/461 [00:00<00:00, 1076.69it/s]
+💾 Cached index saved at D:\processed_spatial\test\index_cache.json
+✅ Total samples: 514
+Class counts (train): Counter({1: 2112, 0: 254})
+🧩 num_workers=0, train_batches=592, val_batches=128
+C:\Users\Wolf\.conda\envs\deepfake\lib\site-packages\torch\optim\lr_scheduler.py:62: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.
+  warnings.warn(
+C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:365: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()
+🔥 Using device: cuda
+🚀 GPU: NVIDIA GeForce RTX 3060 | Memory: 12.88 GB
+
+Epoch [1/40]
+Training:   0%|                                                                                | 0/592 [00:00<?, ?it/s]C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:265: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast():
+                                                                                                                       
+📊 Train Loss: 0.4096 | Train Acc: 69.02%
+📈 Val Loss: 1.2331 | Val Acc: 56.95%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 56.95%
+
+Epoch [2/40]
+                                                                                                                       
+📊 Train Loss: 0.3485 | Train Acc: 80.94%
+📈 Val Loss: 0.9015 | Val Acc: 67.91%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 67.91%
+
+Epoch [3/40]
+                                                                                                                       
+📊 Train Loss: 0.2843 | Train Acc: 85.25%
+📈 Val Loss: 0.5657 | Val Acc: 82.58%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 82.58%
+
+Epoch [4/40]
+C:\Users\Wolf\AppData\Local\Temp\ipykernel_22804\3846049256.py:385: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler()  # reinit scaler (safe)
+📊 Train Loss: 0.2886 | Train Acc: 85.29%
+📈 Val Loss: 0.7694 | Val Acc: 73.58%
+
+Epoch [5/40]
+🔓 Unfroze backbone layers: ['layer4']
+🔁 Optimizer reinitialized to include backbone params (lower lr).
+                                                                                                                       
+📊 Train Loss: 0.2182 | Train Acc: 89.01%
+📈 Val Loss: 0.6038 | Val Acc: 80.43%
+
+Epoch [6/40]
+                                                                                                                       
+📊 Train Loss: 0.2282 | Train Acc: 89.01%
+📈 Val Loss: 0.5636 | Val Acc: 83.56%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 83.56%
+
+Epoch [7/40]
+                                                                                                                       
+📊 Train Loss: 0.2151 | Train Acc: 89.18%
+📈 Val Loss: 0.6701 | Val Acc: 79.84%
+
+Epoch [8/40]
+                                                                                                                       
+📊 Train Loss: 0.2209 | Train Acc: 90.57%
+📈 Val Loss: 0.6926 | Val Acc: 81.41%
+
+Epoch [9/40]
+                                                                                                                       
+📊 Train Loss: 0.2047 | Train Acc: 90.24%
+📈 Val Loss: 0.5301 | Val Acc: 84.34%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 84.34%
+
+Epoch [10/40]
+                                                                                                                       
+📊 Train Loss: 0.2080 | Train Acc: 90.07%
+📈 Val Loss: 0.5221 | Val Acc: 84.54%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 84.54%
+
+Epoch [11/40]
+                                                                                                                       
+📊 Train Loss: 0.2226 | Train Acc: 90.45%
+📈 Val Loss: 0.6822 | Val Acc: 82.19%
+
+Epoch [12/40]
+                                                                                                                       
+📊 Train Loss: 0.1999 | Train Acc: 91.08%
+📈 Val Loss: 0.4895 | Val Acc: 86.11%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 86.11%
+
+Epoch [13/40]
+                                                                                                                       
+📊 Train Loss: 0.1760 | Train Acc: 92.05%
+📈 Val Loss: 0.4651 | Val Acc: 85.52%
+
+Epoch [14/40]
+                                                                                                                       
+📊 Train Loss: 0.1725 | Train Acc: 92.27%
+📈 Val Loss: 0.5157 | Val Acc: 85.91%
+
+Epoch [15/40]
+                                                                                                                       
+📊 Train Loss: 0.1909 | Train Acc: 91.00%
+📈 Val Loss: 0.6154 | Val Acc: 83.76%
+
+Epoch [16/40]
+                                                                                                                       
+📊 Train Loss: 0.1814 | Train Acc: 91.80%
+📈 Val Loss: 0.4574 | Val Acc: 88.26%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 88.26%
+
+Epoch [17/40]
+                                                                                                                       
+📊 Train Loss: 0.1805 | Train Acc: 91.72%
+📈 Val Loss: 0.5181 | Val Acc: 86.30%
+
+Epoch [18/40]
+                                                                                                                       
+📊 Train Loss: 0.1839 | Train Acc: 91.42%
+📈 Val Loss: 0.5050 | Val Acc: 86.30%
+
+Epoch [19/40]
+                                                                                                                       
+📊 Train Loss: 0.1878 | Train Acc: 92.52%
+📈 Val Loss: 0.7623 | Val Acc: 81.21%
+
+Epoch [20/40]
+                                                                                                                       
+📊 Train Loss: 0.1968 | Train Acc: 91.89%
+📈 Val Loss: 0.5306 | Val Acc: 86.30%
+
+Epoch [21/40]
+                                                                                                                       
+📊 Train Loss: 0.1928 | Train Acc: 92.94%
+📈 Val Loss: 0.5214 | Val Acc: 86.69%
+
+Epoch [22/40]
+                                                                                                                       
+📊 Train Loss: 0.1393 | Train Acc: 93.87%
+📈 Val Loss: 0.5379 | Val Acc: 87.28%
+
+Epoch [23/40]
+                                                                                                                       
+📊 Train Loss: 0.1773 | Train Acc: 92.31%
+📈 Val Loss: 0.5112 | Val Acc: 86.69%
+
+Epoch [24/40]
+                                                                                                                       
+📊 Train Loss: 0.1588 | Train Acc: 93.15%
+📈 Val Loss: 0.6888 | Val Acc: 83.37%
+
+Epoch [25/40]
+                                                                                                                       
+📊 Train Loss: 0.1479 | Train Acc: 93.79%
+📈 Val Loss: 0.6621 | Val Acc: 83.95%
+
+Epoch [26/40]
+                                                                                                                       
+📊 Train Loss: 0.1554 | Train Acc: 93.49%
+📈 Val Loss: 0.6885 | Val Acc: 83.56%
+
+Epoch [27/40]
+                                                                                                                       
+📊 Train Loss: 0.1570 | Train Acc: 93.03%
+📈 Val Loss: 0.5395 | Val Acc: 84.93%
+
+Epoch [28/40]
+                                                                                                                       
+📊 Train Loss: 0.1530 | Train Acc: 94.00%
+📈 Val Loss: 0.5216 | Val Acc: 88.45%
+💾 Saved best checkpoint: Temporal_fixed_results\Processed_spatial_20251011_195713\best_temporal_Processed_spatial.pth with Val Acc: 88.45%
+
+Epoch [29/40]
+                                                                                                                       
+📊 Train Loss: 0.1661 | Train Acc: 93.03%
+📈 Val Loss: 0.4951 | Val Acc: 87.28%
+
+Epoch [30/40]
+                                                                                                                       
+📊 Train Loss: 0.1495 | Train Acc: 93.28%
+📈 Val Loss: 0.6855 | Val Acc: 84.74%
+
+Epoch [31/40]
+                                                                                                                       
+📊 Train Loss: 0.1261 | Train Acc: 94.89%
+📈 Val Loss: 0.6178 | Val Acc: 86.89%
+
+Epoch [32/40]
+                                                                                                                       
+📊 Train Loss: 0.1559 | Train Acc: 93.45%
+📈 Val Loss: 0.4572 | Val Acc: 88.26%
+
+Epoch [33/40]
+                                                                                                                       
+📊 Train Loss: 0.1513 | Train Acc: 93.91%
+📈 Val Loss: 0.6121 | Val Acc: 85.52%
+
+Epoch [34/40]
+                                                                                                                       
+📊 Train Loss: 0.1221 | Train Acc: 94.51%
+📈 Val Loss: 0.6954 | Val Acc: 84.34%
+
+Epoch [35/40]
+                                                                                                                       
+📊 Train Loss: 0.1173 | Train Acc: 94.72%
+📈 Val Loss: 0.5221 | Val Acc: 88.26%
+
+Epoch [36/40]
+                                                                                                                       
+📊 Train Loss: 0.1523 | Train Acc: 94.21%
+📈 Val Loss: 0.6235 | Val Acc: 86.11%
+
+Epoch [37/40]
+                                                                                                                       
+📊 Train Loss: 0.1550 | Train Acc: 94.08%
+📈 Val Loss: 0.6035 | Val Acc: 87.48%
+
+Epoch [38/40]
+                                                                                                                       
+📊 Train Loss: 0.1436 | Train Acc: 94.38%
+📈 Val Loss: 0.7602 | Val Acc: 83.56%
+
+Epoch [39/40]
+                                                                                                                       
+📊 Train Loss: 0.1300 | Train Acc: 94.72%
+📈 Val Loss: 0.4884 | Val Acc: 88.45%
+
+Epoch [40/40]
+                                                                                                                       
+📊 Train Loss: 0.1453 | Train Acc: 94.46%
+📈 Val Loss: 0.5113 | Val Acc: 88.45%
+                                                                                                                       
+
+✅ Training complete for Processed spatial | Best Val Acc: 88.45%
+Results saved at: Temporal_fixed_results\Processed_spatial_20251011_195713
+
+📊 FINAL RESULTS:
+  • FF++ cleaned: 81.78% | results: Temporal_fixed_results\FF++_cleaned_20251011_155130
+  • Processed spatial: 88.45% | results: Temporal_fixed_results\Processed_spatial_20251011_195713
+
+
+
+
